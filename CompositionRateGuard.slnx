@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="CompositionRateGuard/CompositionRateGuard.vcxproj" Id="1c6fff8a-12f9-4bcd-9727-43e4e4722a35" />
+</Solution>
