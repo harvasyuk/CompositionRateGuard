@@ -2,6 +2,7 @@
 
 #include "app_constants.h"
 #include "app_types.h"
+#include "composition_rate.h"
 #include "logging.h"
 #include "mpc_player.h"
 #include "overlay.h"
@@ -11,6 +12,7 @@
 #include <shellapi.h>
 
 #include <cstdio>
+#include <deque>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -19,11 +21,11 @@ namespace crg {
 	namespace {
 
 		constexpr UINT kTrayCallback = WM_APP + 1;
+		constexpr UINT kOpenPendingMedia = WM_APP + 2;
+		constexpr UINT kForwardTimeoutMs = 5000;
 		constexpr ULONG_PTR kOpenMediaCopyDataId = 0x4352474D; // "CRGM"
 		constexpr UINT_PTR kPollTimerId = 1;
-		constexpr UINT_PTR kAnimationTimerId = 2;
 		constexpr UINT kPollIntervalMs = 1000;
-		constexpr UINT kAnimationIntervalMs = 16;
 
 		constexpr UINT kCmdEnabled = 1001;
 		constexpr UINT kCmdStartWithWindows = 1002;
@@ -52,6 +54,12 @@ namespace crg {
 		std::wstring g_iniPath;
 		bool g_exitWhenPlayersClose = false;
 		ULONGLONG g_lastPlayerLaunchTick = 0;
+		// Media forwarded by other instances, launched outside WM_COPYDATA.
+		std::deque<std::wstring> g_pendingMediaPaths;
+		// Last rate logged while the guard is disabled; reset on enable so each
+		// disabled period starts by logging its initial rate.
+		CompositionRate g_lastLoggedRate;
+		bool g_hasLoggedRate = false;
 
 		void SetDetectionState(DetectionState state, const PlayerWindow& player) {
 			if (g_detectionState == state) {
@@ -76,7 +84,12 @@ namespace crg {
 		}
 
 		bool LaunchRequestedMedia(const std::wstring& mediaPath) {
-			if (!LaunchMediaFile(g_controlWindow, mediaPath, g_settings, g_iniPath)) {
+			const std::wstring previousPlayerPath = g_settings.playerPath;
+			const bool launched = LaunchMediaFile(g_controlWindow, mediaPath, g_settings.playerPath);
+			if (g_settings.playerPath != previousPlayerPath) {
+				SaveSettings(g_iniPath, g_settings);
+			}
+			if (!launched) {
 				return false;
 			}
 
@@ -86,26 +99,29 @@ namespace crg {
 			return true;
 		}
 
-		void HideOverlay() {
-			const bool wasVisible = g_overlay.IsVisible();
-			g_overlay.Hide();
-			if (wasVisible && g_controlWindow != nullptr) {
-				KillTimer(g_controlWindow, kAnimationTimerId);
+		void LogCompositionRateChange() {
+			const CompositionRate rate = QueryCompositionRate();
+			if (g_hasLoggedRate && rate.SameAs(g_lastLoggedRate)) {
+				return;
 			}
-		}
 
-		void ShowOverlayFor(const PlayerWindow& player) {
-			const bool wasVisible = g_overlay.IsVisible();
-			g_overlay.ShowFor(player);
-			if (!wasVisible && g_overlay.IsVisible() && g_controlWindow != nullptr) {
-				SetTimer(g_controlWindow, kAnimationTimerId, kAnimationIntervalMs, nullptr);
+			wchar_t text[128]{};
+			FormatCompositionRate(rate, text, std::size(text));
+			if (g_hasLoggedRate) {
+				LogFormat(L"%ls (changed from %.3f Hz).", text, g_lastLoggedRate.ComposeHz());
 			}
+			else {
+				LogFormat(L"%ls.", text);
+			}
+
+			g_lastLoggedRate = rate;
+			g_hasLoggedRate = true;
 		}
 
 		void PollPlayer() {
 			if (g_exitWhenPlayersClose &&
 				GetTickCount64() - g_lastPlayerLaunchTick >= 2000 &&
-				!IsAnyMpcHcProcessRunning()) {
+				!IsAnyPlayerProcessRunning(g_settings.playerPath)) {
 				Log(L"No MPC-HC process remains; exiting association-launched guard.");
 				DestroyWindow(g_controlWindow);
 				return;
@@ -113,27 +129,30 @@ namespace crg {
 
 			if (!g_settings.enabled) {
 				SetDetectionState(DetectionState::Disabled, PlayerWindow{});
-				HideOverlay();
+				g_overlay.Hide();
+				// Without the guard running, record when the unguarded fallback happens.
+				LogCompositionRateChange();
 				return;
 			}
+			g_hasLoggedRate = false;
 
-			const PlayerWindow player = FindPlayerWindow(g_overlay.Window());
+			const PlayerWindow player = FindPlayerWindow(g_overlay.Window(), g_settings.playerPath);
 			if (player.hwnd == nullptr) {
 				SetDetectionState(DetectionState::NoPlayerWindow, player);
-				HideOverlay();
+				g_overlay.Hide();
 				return;
 			}
 
 			if (!IsBorderlessFullscreenWindow(player)) {
 				SetDetectionState(DetectionState::PlayerWindowed, player);
-				HideOverlay();
+				g_overlay.Hide();
 				return;
 			}
 
 			// Tray interactions and utility windows must not momentarily tear down the
 			// guard, so MPC-HC does not need to remain the foreground process.
 			SetDetectionState(DetectionState::BorderlessFullscreen, player);
-			ShowOverlayFor(player);
+			g_overlay.ShowFor(player);
 		}
 
 		void AddTrayIcon() {
@@ -182,7 +201,20 @@ namespace crg {
 				return;
 			}
 
+			// Opening any menu makes DWM restore its composition rate, so only the
+			// display refresh rate is meaningful here.
+			const CompositionRate rate = QueryCompositionRate();
+			wchar_t rateText[128]{};
+			if (rate.valid) {
+				_snwprintf_s(rateText, std::size(rateText), _TRUNCATE,
+					L"Display refresh: %.3f Hz", rate.RefreshHz());
+			}
+			else {
+				wcscpy_s(rateText, L"Display refresh: unavailable");
+			}
+
 			AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CurrentStatusText());
+			AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, rateText);
 			AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 			AppendMenuW(
 				menu,
@@ -264,17 +296,28 @@ namespace crg {
 				if (path[characterCount - 1] != L'\0') {
 					return FALSE;
 				}
-				return LaunchRequestedMedia(path) ? TRUE : FALSE;
+
+				// Launching can show a file dialog or an error box. Do it after
+				// returning, so the forwarding instance is not blocked meanwhile.
+				g_pendingMediaPaths.emplace_back(path);
+				if (g_pendingMediaPaths.size() == 1) {
+					PostMessageW(hwnd, kOpenPendingMedia, 0, 0);
+				}
+				return TRUE;
 			}
+			case kOpenPendingMedia:
+				while (!g_pendingMediaPaths.empty()) {
+					const std::wstring mediaPath = std::move(g_pendingMediaPaths.front());
+					g_pendingMediaPaths.pop_front();
+					LaunchRequestedMedia(mediaPath);
+				}
+				return 0;
 			case WM_CREATE:
 				SetTimer(hwnd, kPollTimerId, kPollIntervalMs, nullptr);
 				return 0;
 			case WM_TIMER:
 				if (wParam == kPollTimerId) {
 					PollPlayer();
-				}
-				else if (wParam == kAnimationTimerId) {
-					g_overlay.Animate();
 				}
 				return 0;
 			case kTrayCallback:
@@ -320,8 +363,7 @@ namespace crg {
 				break;
 			case WM_DESTROY:
 				KillTimer(hwnd, kPollTimerId);
-				KillTimer(hwnd, kAnimationTimerId);
-				HideOverlay();
+				g_overlay.Hide();
 				RemoveTrayIcon();
 				PostQuitMessage(0);
 				return 0;
@@ -390,14 +432,29 @@ namespace crg {
 				return false;
 			}
 
+			// This instance was started by the shell and may take the foreground;
+			// the tray instance may not. Pass the right on so the MPC-HC window it
+			// starts can come to the front instead of flashing in the taskbar.
+			DWORD guardPid = 0;
+			GetWindowThreadProcessId(window, &guardPid);
+			if (guardPid != 0) {
+				AllowSetForegroundWindow(guardPid);
+			}
+
+			bool allAccepted = true;
 			for (const std::wstring& mediaPath : mediaPaths) {
 				COPYDATASTRUCT data{};
 				data.dwData = kOpenMediaCopyDataId;
 				data.cbData = static_cast<DWORD>((mediaPath.size() + 1) * sizeof(wchar_t));
 				data.lpData = const_cast<wchar_t*>(mediaPath.c_str());
-				SendMessageW(window, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data));
+
+				DWORD_PTR accepted = FALSE;
+				if (SendMessageTimeoutW(window, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data),
+					SMTO_ABORTIFHUNG, kForwardTimeoutMs, &accepted) == 0 || accepted != TRUE) {
+					allAccepted = false;
+				}
 			}
-			return true;
+			return allAccepted;
 		}
 
 		void LoadApplicationIcons() {
@@ -451,7 +508,7 @@ namespace crg {
 			return 0;
 		}
 
-		SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		// DPI awareness (PerMonitorV2) comes from app.manifest.
 		LoadApplicationIcons();
 
 		g_configDirectory = GetConfigDirectory();
@@ -468,8 +525,8 @@ namespace crg {
 			wchar_t message[256]{};
 			_snwprintf_s(message, std::size(message), _TRUNCATE,
 				L"Failed to initialize CompositionRateGuard. Win32 error: %lu", error);
-			MessageBoxW(nullptr, message, kAppName, MB_OK | MB_ICONERROR);
 			Log(message);
+			MessageBoxW(nullptr, message, kAppName, MB_OK | MB_ICONERROR);
 			CloseHandle(g_singleInstanceMutex);
 			g_singleInstanceMutex = nullptr;
 			return 1;

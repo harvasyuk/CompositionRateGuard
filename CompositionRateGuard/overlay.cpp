@@ -7,9 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
-#include <iterator>
 
 namespace crg {
 	namespace {
@@ -28,7 +26,7 @@ namespace crg {
 		windowClass.lpfnWndProc = WindowProc;
 		windowClass.lpszClassName = kOverlayClass;
 		windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-		windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+		// No background brush: the render thread owns every pixel.
 		return RegisterClassExW(&windowClass) != 0;
 	}
 
@@ -56,17 +54,23 @@ namespace crg {
 
 		// Alpha 0 can be optimized away by DWM and does not reliably keep the
 		// desired composition rate.
-		return SetLayeredWindowAttributes(window_, 0, Alpha(), LWA_ALPHA) != FALSE;
+		return SetLayeredWindowAttributes(window_, 0, Alpha(), LWA_ALPHA) != FALSE &&
+			StartRenderThread();
+	}
+
+	Overlay::~Overlay() {
+		StopRenderThread();
 	}
 
 	void Overlay::Destroy() {
+		// The render thread draws into the window, so it must finish first.
+		StopRenderThread();
 		if (window_ != nullptr) {
 			DestroyWindow(window_);
 			window_ = nullptr;
 		}
 		visible_ = false;
 		currentPlayer_ = nullptr;
-		currentPlayerPid_ = 0;
 	}
 
 	void Overlay::SetMode(OverlayMode mode) {
@@ -116,24 +120,18 @@ namespace crg {
 				height,
 				SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-			SetLayeredWindowAttributes(window_, 0, Alpha(), LWA_ALPHA);
-			InvalidateRect(window_, nullptr, TRUE);
-			UpdateWindow(window_);
+			SetEvent(renderEvent_);
 
 			visible_ = true;
 			currentPlayer_ = player.hwnd;
-			currentPlayerPid_ = player.pid;
 			lastRect_ = overlayRect;
 
-			wchar_t message[512]{};
-			_snwprintf_s(
-				message, std::size(message), _TRUNCATE,
+			LogFormat(
 				L"Overlay shown: mode=%d, rect=(%ld,%ld)-(%ld,%ld), player PID=%lu.",
-				static_cast<int>(mode_),
+				static_cast<int>(mode_.load()),
 				overlayRect.left, overlayRect.top,
 				overlayRect.right, overlayRect.bottom,
 				player.pid);
-			Log(message);
 		}
 		else {
 			SetWindowPos(
@@ -146,31 +144,81 @@ namespace crg {
 
 	void Overlay::Hide() {
 		if (window_ != nullptr && visible_) {
+			// The render thread finishes its current frame, then waits.
+			ResetEvent(renderEvent_);
 			ShowWindow(window_, SW_HIDE);
 			visible_ = false;
 			Log(L"Overlay hidden.");
 		}
 		currentPlayer_ = nullptr;
-		currentPlayerPid_ = 0;
 	}
 
-	void Overlay::Animate() {
-		if (!visible_ || window_ == nullptr) {
+	bool Overlay::StartRenderThread() {
+		renderEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (renderEvent_ == nullptr) {
+			return false;
+		}
+
+		stopRendering_ = false;
+		const HWND window = window_;
+		renderThread_ = std::thread([this, window] { RenderLoop(window); });
+		return true;
+	}
+
+	void Overlay::StopRenderThread() {
+		if (renderThread_.joinable()) {
+			stopRendering_ = true;
+			SetEvent(renderEvent_);
+			renderThread_.join();
+		}
+		if (renderEvent_ != nullptr) {
+			CloseHandle(renderEvent_);
+			renderEvent_ = nullptr;
+		}
+	}
+
+	void Overlay::RenderLoop(HWND window) {
+		while (WaitForSingleObject(renderEvent_, INFINITE) == WAIT_OBJECT_0 &&
+			!stopRendering_) {
+			RenderFrame(window);
+
+			// Block until DWM has composed the new content, so exactly one update
+			// is submitted per composition pass. DwmFlush fails when composition
+			// is unavailable; avoid spinning in that case.
+			if (FAILED(DwmFlush())) {
+				Sleep(16);
+			}
+		}
+	}
+
+	void Overlay::RenderFrame(HWND window) {
+		++animationPhase_;
+
+		// Drawing through a window DC outside WM_PAINT is allowed from any thread
+		// and updates the layered window's redirection surface directly.
+		HDC dc = GetDC(window);
+		if (dc == nullptr) {
 			return;
 		}
 
-		++animationPhase_;
-		RedrawWindow(
-			window_,
-			nullptr,
-			nullptr,
-			RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-		DwmFlush();
+		if (mode_ == OverlayMode::VisibleTest) {
+			PaintVisibleGradient(window, dc);
+		}
+		else {
+			// The near-invisible pixel still changes every frame so DWM sees
+			// genuine surface updates rather than a static layered window.
+			const BYTE r = static_cast<BYTE>(64u + ((animationPhase_ * 37u) & 0xBFu));
+			const BYTE g = static_cast<BYTE>((animationPhase_ * 73u) & 0x3Fu);
+			const BYTE b = static_cast<BYTE>(64u + ((animationPhase_ * 109u) & 0xBFu));
+			SetPixelV(dc, 0, 0, RGB(r, g, b));
+		}
+		GdiFlush();
+		ReleaseDC(window, dc);
 	}
 
-	void Overlay::PaintVisibleGradient(HDC dc) {
+	void Overlay::PaintVisibleGradient(HWND window, HDC dc) {
 		RECT client{};
-		GetClientRect(window_, &client);
+		GetClientRect(window, &client);
 		const int width = client.right - client.left;
 		const int height = client.bottom - client.top;
 		if (width <= 0 || height <= 0) {
@@ -267,26 +315,6 @@ namespace crg {
 			return HTTRANSPARENT;
 		case WM_MOUSEACTIVATE:
 			return MA_NOACTIVATE;
-		case WM_ERASEBKGND:
-			return 1;
-		case WM_PAINT: {
-			PAINTSTRUCT paint{};
-			HDC dc = BeginPaint(hwnd, &paint);
-
-			if (mode_ == OverlayMode::VisibleTest) {
-				PaintVisibleGradient(dc);
-			}
-			else {
-				// The near-invisible pixel still changes every frame so DWM sees
-				// genuine surface updates rather than a static layered window.
-				const BYTE r = static_cast<BYTE>(64u + ((animationPhase_ * 37u) & 0xBFu));
-				const BYTE g = static_cast<BYTE>((animationPhase_ * 73u) & 0x3Fu);
-				const BYTE b = static_cast<BYTE>(64u + ((animationPhase_ * 109u) & 0xBFu));
-				SetPixelV(dc, 0, 0, RGB(r, g, b));
-			}
-			EndPaint(hwnd, &paint);
-			return 0;
-		}
 		case WM_NCDESTROY: {
 			const LRESULT result = DefWindowProcW(hwnd, message, wParam, lParam);
 			SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

@@ -17,7 +17,7 @@ The only UI you will see, after starting the app, is the tray menu. Use it to se
 - **Near-invisible 1 x 1 (default):** continuously redraws one pixel in the bottom-right corner of the MPC-HC monitor with alpha 1/255, the lowest nonzero opacity.
 - **Visible test rectangle:** redraws a fully opaque 200 x 40 gradient, making continuous DWM updates easy to verify.
 
-In both modes, the surface is repainted every 16 ms with changing content and synchronized with DWM. It is topmost, click-through, non-activating, absent from Alt+Tab, and active only while MPC-HC is in borderless fullscreen.
+In both modes, a background thread repaints the surface with changing content once per DWM composition pass. It is topmost, click-through, non-activating, absent from Alt+Tab, and active only while MPC-HC is in borderless fullscreen.
 
 Fully transparent surfaces can be optimized away by the Windows graphics stack. The default therefore uses the smallest possible nonzero alpha on a single pixel. The visible mode proves that detection, placement, and continuous rendering are working, but it does not by itself prove that the near-invisible surface prevents the composition-rate fallback.
 
@@ -25,13 +25,13 @@ Fully transparent surfaces can be optimized away by the Windows graphics stack. 
 
 Enable **Start with Windows** in the tray menu to launch the guard automatically when the current user signs in. Disable the same menu item to remove the startup registration.
 
-Move the executable to its permanent location before enabling this option. The startup registration points to the executable's current path.
+Move the executable to its permanent location before enabling this option. The startup registration points to the executable's current path. If you move the executable later, the option shows as disabled; enable it again to register the new path.
 
 ## Open videos using this app
 
 You can make the guard the Windows default app for selected video extensions using **Open with > Choose another app** and browsing to `CompositionRateGuard.exe`. When Windows passes a video file to the guard, it starts MPC-HC with that file.
 
-The first time, the guard looks for a standard MPC-HC installation. If it cannot find one, it asks you to locate `mpc-hc*.exe` and remembers that executable in `guard.ini`. To change it later, close the guard and edit or remove the `Executable` value in the `[Player]` section.
+The first time, the guard looks for a standard MPC-HC installation. If it cannot find one, it asks you to locate `mpc-hc*.exe` and remembers that executable in `guard.ini`. To change it later, close the guard and edit or remove the `Executable` value in the `[Player]` section. Players are recognized by an `mpc-hc*.exe` file name or by the file name of this configured executable, so a renamed build also works.
 
 Only one guard instance runs. Opening more videos forwards them to that instance, so MPC-HC can apply its own single/multiple-player preference. Once all MPC-HC processes have closed, an instance that has opened a video exits automatically. Launching the guard directly with no file keeps the normal tray utility running.
 
@@ -68,6 +68,8 @@ The project uses C++17 and links the static MSVC runtime.
 
 The sole success criterion is preventing the composition-rate fallback. Any effect on visible stuttering is secondary.
 
+The tray menu shows the current display refresh rate. It does not show the composition rate, because opening any menu makes DWM restore it. While the guard is disabled, every change of the composition rate is written to the log, so you can record when the fallback happens without the guard. Windows reports these rates for the primary display only.
+
 ## Files
 
 Settings and logs are stored in:
@@ -76,13 +78,16 @@ Settings and logs are stored in:
 %LOCALAPPDATA%\CompositionRateGuard\
 ```
 
+When `guard.log` is larger than 1 MB at startup, it is renamed to `guard.log.old` and a new log is started.
+
 ## Source layout
 
 - `main.cpp` contains only the Windows entry point.
 - `application.cpp` coordinates lifecycle, timers, the tray menu, and single-instance handoff.
 - `settings.cpp` owns INI persistence and Start with Windows registration.
+- `composition_rate.cpp` queries the DWM composition and refresh rates.
 - `mpc_player.cpp` finds, launches, and detects MPC-HC.
-- `overlay.cpp` owns the composition surface and its window procedure.
+- `overlay.cpp` owns the composition surface, its window procedure, and the render thread.
 - `logging.cpp` owns timestamped file logging.
 - `app_types.h` and `app_constants.h` contain the shared types and constants.
 

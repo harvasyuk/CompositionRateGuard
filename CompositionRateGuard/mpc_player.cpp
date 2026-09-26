@@ -2,7 +2,6 @@
 
 #include "app_constants.h"
 #include "logging.h"
-#include "settings.h"
 
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -14,12 +13,11 @@
 #include <cwctype>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace crg {
 	namespace {
-
-		constexpr size_t kLongPathCapacity = 32768;
 
 		std::wstring ToLower(std::wstring value) {
 			std::transform(value.begin(), value.end(), value.begin(),
@@ -37,6 +35,12 @@ namespace crg {
 			// Support standard names plus renamed variants such as mpc-hc64_nvo.exe.
 			return name.size() >= 10 && name.rfind(L"mpc-hc", 0) == 0 &&
 				name.compare(name.size() - 4, 4, L".exe") == 0;
+		}
+
+		// Also accept the executable the user configured, which may have any name.
+		bool IsPlayerExecutableName(const std::wstring& executableName, const std::wstring& playerPath) {
+			return IsMpcHcExecutableName(executableName) ||
+				(!playerPath.empty() && ToLower(executableName) == ToLower(GetBaseName(playerPath)));
 		}
 
 		bool IsExistingFile(const std::wstring& path) {
@@ -151,17 +155,37 @@ namespace crg {
 			return quoted;
 		}
 
-		bool IsMpcHcProcess(DWORD pid) {
+		bool IsPlayerProcess(DWORD pid, const std::wstring& playerPath) {
 			HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 			if (process == nullptr) {
 				return false;
 			}
 
-			std::vector<wchar_t> path(kLongPathCapacity);
-			DWORD size = static_cast<DWORD>(path.size());
-			const BOOL success = QueryFullProcessImageNameW(process, 0, path.data(), &size);
+			// Nearly all image paths fit in MAX_PATH; only allocate for long ones.
+			std::wstring imagePath;
+			wchar_t shortPath[MAX_PATH];
+			DWORD size = static_cast<DWORD>(std::size(shortPath));
+			if (QueryFullProcessImageNameW(process, 0, shortPath, &size)) {
+				imagePath.assign(shortPath, size);
+			}
+			else if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+				std::vector<wchar_t> longPath(kLongPathCapacity);
+				size = static_cast<DWORD>(longPath.size());
+				if (QueryFullProcessImageNameW(process, 0, longPath.data(), &size)) {
+					imagePath.assign(longPath.data(), size);
+				}
+			}
 			CloseHandle(process);
-			return success && IsMpcHcExecutableName(GetBaseName(std::wstring(path.data(), size)));
+			return !imagePath.empty() &&
+				IsPlayerExecutableName(GetBaseName(imagePath), playerPath);
+		}
+
+		// Windows on another virtual desktop, or hidden by the shell, still report
+		// as visible but are not on screen.
+		bool IsCloaked(HWND hwnd) {
+			DWORD cloaked = 0;
+			return SUCCEEDED(DwmGetWindowAttribute(
+				hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0;
 		}
 
 		RECT GetWindowBounds(HWND hwnd) {
@@ -181,8 +205,23 @@ namespace crg {
 
 		struct FindPlayerContext {
 			HWND overlayWindow = nullptr;
+			const std::wstring* playerPath = nullptr;
 			PlayerWindow best;
+			// Processes already checked during this enumeration; many windows share
+			// a process. PID reuse within one short pass is not a practical concern.
+			std::vector<std::pair<DWORD, bool>> checkedProcesses;
 		};
+
+		bool IsPlayerProcessCached(FindPlayerContext& context, DWORD pid) {
+			for (const auto& [checkedPid, isPlayer] : context.checkedProcesses) {
+				if (checkedPid == pid) {
+					return isPlayer;
+				}
+			}
+			const bool isPlayer = IsPlayerProcess(pid, *context.playerPath);
+			context.checkedProcesses.emplace_back(pid, isPlayer);
+			return isPlayer;
+		}
 
 		BOOL CALLBACK FindPlayerWindowCallback(HWND hwnd, LPARAM parameter) {
 			auto* context = reinterpret_cast<FindPlayerContext*>(parameter);
@@ -193,19 +232,20 @@ namespace crg {
 			}
 
 			const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-			if ((style & WS_CHILD) != 0) {
+			if ((style & WS_CHILD) != 0 || IsCloaked(hwnd)) {
+				return TRUE;
+			}
+
+			// Cheap size check first: opening the process is the expensive part.
+			const RECT bounds = GetWindowBounds(hwnd);
+			const long long area = RectArea(bounds);
+			if (area <= best.area) {
 				return TRUE;
 			}
 
 			DWORD pid = 0;
 			GetWindowThreadProcessId(hwnd, &pid);
-			if (pid == 0 || !IsMpcHcProcess(pid)) {
-				return TRUE;
-			}
-
-			const RECT bounds = GetWindowBounds(hwnd);
-			const long long area = RectArea(bounds);
-			if (area <= best.area) {
+			if (pid == 0 || !IsPlayerProcessCached(*context, pid)) {
 				return TRUE;
 			}
 
@@ -228,27 +268,18 @@ namespace crg {
 
 	} // namespace
 
-	bool LaunchMediaFile(
-		HWND owner,
-		const std::wstring& mediaPath,
-		Settings& settings,
-		const std::wstring& iniPath) {
-		std::wstring executable = FindMpcExecutable(settings.playerPath);
+	bool LaunchMediaFile(HWND owner, const std::wstring& mediaPath, std::wstring& playerPath) {
+		std::wstring executable = FindMpcExecutable(playerPath);
 		if (executable.empty()) {
 			executable = ChooseMpcExecutable(owner);
 			if (executable.empty()) {
 				Log(L"MPC-HC selection was cancelled; media was not opened.");
 				return false;
 			}
-			settings.playerPath = executable;
-			SaveSettings(iniPath, settings);
 		}
-		else if (settings.playerPath != executable) {
-			settings.playerPath = executable;
-			SaveSettings(iniPath, settings);
-		}
+		playerPath = executable;
 
-		std::wstring commandLine =
+		const std::wstring commandLine =
 			QuoteCommandLineArgument(executable) + L" " + QuoteCommandLineArgument(mediaPath);
 		std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
 		mutableCommandLine.push_back(L'\0');
@@ -256,10 +287,12 @@ namespace crg {
 		STARTUPINFOW startup{};
 		startup.cb = sizeof(startup);
 		PROCESS_INFORMATION process{};
+		// Start suspended so the foreground right is granted before MPC-HC can
+		// create its window.
 		if (!CreateProcessW(executable.c_str(), mutableCommandLine.data(), nullptr, nullptr,
-			FALSE, 0, nullptr, nullptr, &startup, &process)) {
+			FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) {
 			const DWORD error = GetLastError();
-			wchar_t message[512]{};
+			wchar_t message[128]{};
 			_snwprintf_s(message, std::size(message), _TRUNCATE,
 				L"MPC-HC could not be started (Win32 error %lu).", error);
 			Log(message);
@@ -267,13 +300,24 @@ namespace crg {
 			return false;
 		}
 
+		// Fails harmlessly when the guard itself has no right to pass on.
+		AllowSetForegroundWindow(process.dwProcessId);
+		if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+			// Never leave a suspended player behind.
+			TerminateProcess(process.hProcess, 1);
+			CloseHandle(process.hThread);
+			CloseHandle(process.hProcess);
+			Log(L"MPC-HC could not be resumed after starting.");
+			MessageBoxW(owner, L"MPC-HC could not be started.", kAppName, MB_OK | MB_ICONERROR);
+			return false;
+		}
 		CloseHandle(process.hThread);
 		CloseHandle(process.hProcess);
 		LogFormat(L"Asked MPC-HC to open: %ls", mediaPath.c_str());
 		return true;
 	}
 
-	bool IsAnyMpcHcProcessRunning() {
+	bool IsAnyPlayerProcessRunning(const std::wstring& playerPath) {
 		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 		if (snapshot == INVALID_HANDLE_VALUE) {
 			// Staying alive is safer than exiting while playback might be active.
@@ -285,7 +329,7 @@ namespace crg {
 		bool found = false;
 		if (Process32FirstW(snapshot, &entry)) {
 			do {
-				if (IsMpcHcExecutableName(entry.szExeFile)) {
+				if (IsPlayerExecutableName(entry.szExeFile, playerPath)) {
 					found = true;
 					break;
 				}
@@ -295,9 +339,10 @@ namespace crg {
 		return found;
 	}
 
-	PlayerWindow FindPlayerWindow(HWND overlayWindow) {
+	PlayerWindow FindPlayerWindow(HWND overlayWindow, const std::wstring& playerPath) {
 		FindPlayerContext context{};
 		context.overlayWindow = overlayWindow;
+		context.playerPath = &playerPath;
 		EnumWindows(FindPlayerWindowCallback, reinterpret_cast<LPARAM>(&context));
 		return context.best;
 	}
@@ -336,9 +381,7 @@ namespace crg {
 		wchar_t className[256]{};
 		GetClassNameW(player.hwnd, className, static_cast<int>(std::size(className)));
 
-		wchar_t message[1024]{};
-		_snwprintf_s(
-			message, std::size(message), _TRUNCATE,
+		LogFormat(
 			L"%ls hwnd=0x%p pid=%lu class=%ls style=0x%llX exStyle=0x%llX "
 			L"bounds=(%ld,%ld)-(%ld,%ld) monitor=(%ld,%ld)-(%ld,%ld).",
 			state,
@@ -351,7 +394,6 @@ namespace crg {
 			player.bounds.right, player.bounds.bottom,
 			player.monitor.left, player.monitor.top,
 			player.monitor.right, player.monitor.bottom);
-		Log(message);
 	}
 
 } // namespace crg

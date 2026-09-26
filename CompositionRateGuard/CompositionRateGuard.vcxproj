@@ -157,6 +157,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="application.cpp" />
+    <ClCompile Include="composition_rate.cpp" />
     <ClCompile Include="logging.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mpc_player.cpp" />
@@ -167,6 +168,7 @@
     <ClInclude Include="app_constants.h" />
     <ClInclude Include="app_types.h" />
     <ClInclude Include="application.h" />
+    <ClInclude Include="composition_rate.h" />
     <ClInclude Include="logging.h" />
     <ClInclude Include="mpc_player.h" />
     <ClInclude Include="overlay.h" />

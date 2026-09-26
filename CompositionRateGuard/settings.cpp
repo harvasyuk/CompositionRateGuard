@@ -1,5 +1,7 @@
 #include "settings.h"
 
+#include "app_constants.h"
+
 #include <windows.h>
 
 #include <cstdio>
@@ -11,7 +13,6 @@ namespace crg {
 
 		constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 		constexpr wchar_t kRunValueName[] = L"CompositionRateGuard";
-		constexpr size_t kLongPathCapacity = 32768;
 
 		std::wstring GetExecutablePath() {
 			std::vector<wchar_t> path(kLongPathCapacity);
@@ -21,6 +22,12 @@ namespace crg {
 				return {};
 			}
 			return std::wstring(path.data(), length);
+		}
+
+		// The Run value this executable registers; empty if its path is unknown.
+		std::wstring GetStartupCommand() {
+			const std::wstring executablePath = GetExecutablePath();
+			return executablePath.empty() ? std::wstring() : L"\"" + executablePath + L"\"";
 		}
 
 	} // namespace
@@ -81,14 +88,22 @@ namespace crg {
 	bool IsStartupEnabled() {
 		std::vector<wchar_t> command(kLongPathCapacity);
 		DWORD size = static_cast<DWORD>(command.size() * sizeof(wchar_t));
-		return RegGetValueW(
+		if (RegGetValueW(
 			HKEY_CURRENT_USER,
 			kRunKey,
 			kRunValueName,
 			RRF_RT_REG_SZ,
 			nullptr,
 			command.data(),
-			&size) == ERROR_SUCCESS;
+			&size) != ERROR_SUCCESS) {
+			return false;
+		}
+
+		// An entry left behind by a moved or renamed executable does not count, so
+		// enabling the option again rewrites it with the current path.
+		const std::wstring expected = GetStartupCommand();
+		return !expected.empty() &&
+			CompareStringOrdinal(command.data(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
 	}
 
 	bool SetStartupEnabled(bool enabled) {
@@ -109,13 +124,12 @@ namespace crg {
 
 		LSTATUS result = ERROR_SUCCESS;
 		if (enabled) {
-			const std::wstring executablePath = GetExecutablePath();
-			if (executablePath.empty()) {
+			const std::wstring command = GetStartupCommand();
+			if (command.empty()) {
 				RegCloseKey(key);
 				return false;
 			}
 
-			const std::wstring command = L"\"" + executablePath + L"\"";
 			result = RegSetValueExW(
 				key,
 				kRunValueName,
