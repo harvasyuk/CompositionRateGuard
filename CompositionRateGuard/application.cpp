@@ -23,6 +23,7 @@ namespace crg {
 		constexpr UINT kTrayCallback = WM_APP + 1;
 		constexpr UINT kOpenPendingMedia = WM_APP + 2;
 		constexpr UINT kForwardTimeoutMs = 5000;
+		constexpr ULONGLONG kHandoffTimeoutMs = 10000;
 		constexpr ULONG_PTR kOpenMediaCopyDataId = 0x4352474D; // "CRGM"
 		constexpr UINT_PTR kPollTimerId = 1;
 		constexpr UINT kPollIntervalMs = 1000;
@@ -420,18 +421,9 @@ namespace crg {
 			return mediaPaths;
 		}
 
-		bool ForwardMediaToRunningInstance(const std::vector<std::wstring>& mediaPaths) {
-			HWND window = nullptr;
-			for (int attempt = 0; attempt < 100 && window == nullptr; ++attempt) {
-				window = FindWindowW(kControlClass, nullptr);
-				if (window == nullptr) {
-					Sleep(50);
-				}
-			}
-			if (window == nullptr) {
-				return false;
-			}
-
+		// Sends paths to the running instance, removing each accepted one, and
+		// returns true once all were accepted.
+		bool ForwardMediaToWindow(HWND window, std::vector<std::wstring>& mediaPaths) {
 			// This instance was started by the shell and may take the foreground;
 			// the tray instance may not. Pass the right on so the MPC-HC window it
 			// starts can come to the front instead of flashing in the taskbar.
@@ -441,8 +433,8 @@ namespace crg {
 				AllowSetForegroundWindow(guardPid);
 			}
 
-			bool allAccepted = true;
-			for (const std::wstring& mediaPath : mediaPaths) {
+			while (!mediaPaths.empty()) {
+				const std::wstring& mediaPath = mediaPaths.front();
 				COPYDATASTRUCT data{};
 				data.dwData = kOpenMediaCopyDataId;
 				data.cbData = static_cast<DWORD>((mediaPath.size() + 1) * sizeof(wchar_t));
@@ -451,10 +443,43 @@ namespace crg {
 				DWORD_PTR accepted = FALSE;
 				if (SendMessageTimeoutW(window, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data),
 					SMTO_ABORTIFHUNG, kForwardTimeoutMs, &accepted) == 0 || accepted != TRUE) {
-					allAccepted = false;
+					return false;
 				}
+				mediaPaths.erase(mediaPaths.begin());
 			}
-			return allAccepted;
+			return true;
+		}
+
+		enum class HandoffResult {
+			Forwarded,
+			BecamePrimary,
+			Failed,
+		};
+
+		// Called when another instance holds the single-instance mutex. That
+		// instance may still be starting (no window yet) or shutting down (window
+		// gone or going), so keep trying until it accepts the media or has exited
+		// and this instance can take over.
+		HandoffResult HandOffMedia(std::vector<std::wstring>& mediaPaths) {
+			const ULONGLONG deadline = GetTickCount64() + kHandoffTimeoutMs;
+			do {
+				const HWND window = FindWindowW(kControlClass, nullptr);
+				if (window != nullptr && ForwardMediaToWindow(window, mediaPaths)) {
+					return HandoffResult::Forwarded;
+				}
+
+				if (window == nullptr) {
+					if (g_singleInstanceMutex != nullptr) {
+						CloseHandle(g_singleInstanceMutex);
+					}
+					g_singleInstanceMutex = CreateMutexW(nullptr, FALSE, kMutexName);
+					if (g_singleInstanceMutex != nullptr && GetLastError() != ERROR_ALREADY_EXISTS) {
+						return HandoffResult::BecamePrimary;
+					}
+				}
+				Sleep(50);
+			} while (GetTickCount64() < deadline);
+			return HandoffResult::Failed;
 		}
 
 		void LoadApplicationIcons() {
@@ -485,7 +510,7 @@ namespace crg {
 
 	int RunApplication(HINSTANCE instance) {
 		g_instance = instance;
-		const std::vector<std::wstring> mediaPaths = GetMediaArguments();
+		std::vector<std::wstring> mediaPaths = GetMediaArguments();
 
 		g_singleInstanceMutex = CreateMutexW(nullptr, FALSE, kMutexName);
 		if (g_singleInstanceMutex == nullptr) {
@@ -493,19 +518,30 @@ namespace crg {
 		}
 
 		if (GetLastError() == ERROR_ALREADY_EXISTS) {
+			HandoffResult result = HandoffResult::Forwarded;
 			if (mediaPaths.empty()) {
 				MessageBoxW(nullptr, L"CompositionRateGuard is already running.", kAppName, MB_OK);
 			}
-			else if (!ForwardMediaToRunningInstance(mediaPaths)) {
-				MessageBoxW(
-					nullptr,
-					L"CompositionRateGuard is already starting, but the video could not be sent to it.",
-					kAppName,
-					MB_OK | MB_ICONERROR);
+			else {
+				result = HandOffMedia(mediaPaths);
+				if (result == HandoffResult::Failed) {
+					MessageBoxW(
+						nullptr,
+						L"CompositionRateGuard is already running, but the video could not be sent to it.",
+						kAppName,
+						MB_OK | MB_ICONERROR);
+				}
 			}
-			CloseHandle(g_singleInstanceMutex);
-			g_singleInstanceMutex = nullptr;
-			return 0;
+
+			if (result != HandoffResult::BecamePrimary) {
+				if (g_singleInstanceMutex != nullptr) {
+					CloseHandle(g_singleInstanceMutex);
+					g_singleInstanceMutex = nullptr;
+				}
+				return 0;
+			}
+			// The previous instance exited; continue as the primary instance and
+			// open the remaining media below.
 		}
 
 		// DPI awareness (PerMonitorV2) comes from app.manifest.
